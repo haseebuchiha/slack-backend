@@ -57,11 +57,13 @@ async function slackOAuthExchange(code) {
 
 /**
  * JSON-RPC over WebSocket to OpenClaw gateway.
+ * Adds strict jsonrpc envelope and better close/error diagnostics.
  */
 async function gatewayCall(method, params = {}) {
   return new Promise((resolve, reject) => {
     const id = `rpc-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     let settled = false;
+    let lastMessage = null;
 
     const ws = new WebSocket(OPENCLAW_GATEWAY_URL, {
       headers: {
@@ -69,58 +71,66 @@ async function gatewayCall(method, params = {}) {
       },
     });
 
-    const timer = setTimeout(() => {
+    const done = (err, value) => {
       if (settled) return;
       settled = true;
+      clearTimeout(timer);
       try {
         ws.close();
       } catch {}
-      reject(new Error("Gateway WebSocket timeout"));
+      if (err) reject(err);
+      else resolve(value);
+    };
+
+    const timer = setTimeout(() => {
+      done(new Error(`Gateway WS timeout. Last message: ${lastMessage || "none"}`));
     }, 25000);
 
     ws.on("open", () => {
-      ws.send(JSON.stringify({ id, method, params }));
+      ws.send(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id,
+          method,
+          params,
+        })
+      );
     });
 
     ws.on("message", (buf) => {
-      if (settled) return;
+      const raw = buf.toString();
+      lastMessage = raw;
 
       let msg;
       try {
-        msg = JSON.parse(buf.toString());
+        msg = JSON.parse(raw);
       } catch {
         return; // ignore non-JSON frames
       }
 
-      // ignore unrelated events/messages
-      if (!msg || msg.id !== id) return;
-
-      settled = true;
-      clearTimeout(timer);
-      try {
-        ws.close();
-      } catch {}
+      // Ignore events/unrelated responses
+      if (msg.id !== id) return;
 
       if (msg.error) {
-        reject(new Error(msg.error.message || JSON.stringify(msg.error)));
-        return;
+        return done(new Error(msg.error.message || JSON.stringify(msg.error)));
       }
 
-      resolve(msg.result ?? msg);
+      return done(null, msg.result ?? msg);
     });
 
     ws.on("error", (err) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      reject(err);
+      done(err);
     });
 
-    ws.on("close", () => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      reject(new Error("Gateway WebSocket closed before response"));
+    ws.on("close", (code, reasonBuf) => {
+      const reason = reasonBuf?.toString?.() || "";
+      if (!settled) {
+        done(
+          new Error(
+            `Gateway WS closed (code=${code}, reason=${reason || "none"}, last=${lastMessage || "none"})`
+          )
+        );
+      }
     });
   });
 }

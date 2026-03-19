@@ -1,5 +1,6 @@
 const express = require("express");
 const WebSocket = require("ws");
+const crypto = require("node:crypto");
 
 const app = express();
 
@@ -11,6 +12,11 @@ const {
   SLACK_APP_TOKEN, // xapp-... (same app token reused for all workspaces)
   OPENCLAW_GATEWAY_URL, // ws://... or wss://...
   OPENCLAW_GATEWAY_TOKEN, // gateway auth token
+
+  // Optional overrides
+  OPENCLAW_CLIENT_ID = "launchbased-oauth-backend",
+  OPENCLAW_CLIENT_VERSION = "1.0.0",
+  OPENCLAW_CLIENT_PLATFORM = "node",
 } = process.env;
 
 function required(name, value) {
@@ -55,15 +61,61 @@ async function slackOAuthExchange(code) {
   return resp.json();
 }
 
+function buildConnectParams(challengeNonce) {
+  // NOTE:
+  // Modern gateways may require full device-signed identity.
+  // This handshake is protocol-correct and works where token-only operator auth is allowed.
+  return {
+    minProtocol: 3,
+    maxProtocol: 3,
+    client: {
+      id: OPENCLAW_CLIENT_ID,
+      version: OPENCLAW_CLIENT_VERSION,
+      platform: OPENCLAW_CLIENT_PLATFORM,
+      mode: "operator",
+    },
+    role: "operator",
+    scopes: [
+      "operator.read",
+      "operator.write",
+      "operator.admin",
+      "operator.approvals",
+      "operator.pairing",
+    ],
+    caps: [],
+    commands: [],
+    permissions: {},
+    auth: { token: OPENCLAW_GATEWAY_TOKEN },
+    locale: "en-US",
+    userAgent: `${OPENCLAW_CLIENT_ID}/${OPENCLAW_CLIENT_VERSION}`,
+    // Some deployments allow token-only; others require signed device identity.
+    // We still pass nonce to satisfy challenge-bound connect shape.
+    device: {
+      id: `oauth-backend-${crypto
+        .createHash("sha1")
+        .update(OPENCLAW_CLIENT_ID)
+        .digest("hex")
+        .slice(0, 16)}`,
+      nonce: challengeNonce,
+    },
+  };
+}
+
 /**
- * JSON-RPC over WebSocket to OpenClaw gateway.
- * Adds strict jsonrpc envelope and better close/error diagnostics.
+ * Gateway protocol call:
+ * 1) wait connect.challenge
+ * 2) send connect req
+ * 3) send method req
+ * 4) read matching response
  */
 async function gatewayCall(method, params = {}) {
   return new Promise((resolve, reject) => {
-    const id = `rpc-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     let settled = false;
-    let lastMessage = null;
+    let connected = false;
+    let lastRaw = null;
+
+    const connectReqId = `connect-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const methodReqId = `req-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
     const ws = new WebSocket(OPENCLAW_GATEWAY_URL, {
       headers: {
@@ -83,39 +135,76 @@ async function gatewayCall(method, params = {}) {
     };
 
     const timer = setTimeout(() => {
-      done(new Error(`Gateway WS timeout. Last message: ${lastMessage || "none"}`));
-    }, 25000);
+      done(new Error(`Gateway timeout. Last frame: ${lastRaw || "none"}`));
+    }, 30000);
 
     ws.on("open", () => {
-      ws.send(
-        JSON.stringify({
-          jsonrpc: "2.0",
-          id,
-          method,
-          params,
-        })
-      );
+      // wait for connect.challenge
     });
 
     ws.on("message", (buf) => {
       const raw = buf.toString();
-      lastMessage = raw;
+      lastRaw = raw;
 
       let msg;
       try {
         msg = JSON.parse(raw);
       } catch {
-        return; // ignore non-JSON frames
+        return;
       }
 
-      // Ignore events/unrelated responses
-      if (msg.id !== id) return;
+      // 1) Challenge event
+      if (msg?.type === "event" && msg?.event === "connect.challenge") {
+        const nonce = msg?.payload?.nonce;
+        if (!nonce) return done(new Error("Gateway challenge missing nonce"));
 
-      if (msg.error) {
-        return done(new Error(msg.error.message || JSON.stringify(msg.error)));
+        ws.send(
+          JSON.stringify({
+            type: "req",
+            id: connectReqId,
+            method: "connect",
+            params: buildConnectParams(nonce),
+          })
+        );
+        return;
       }
 
-      return done(null, msg.result ?? msg);
+      // 2) Connect response
+      if (msg?.type === "res" && msg?.id === connectReqId) {
+        if (!msg.ok) {
+          const detail = msg?.error?.details
+            ? ` details=${JSON.stringify(msg.error.details)}`
+            : "";
+          return done(new Error(`connect failed: ${msg?.error?.message || "unknown"}${detail}`));
+        }
+
+        connected = true;
+
+        // now send target method request
+        ws.send(
+          JSON.stringify({
+            type: "req",
+            id: methodReqId,
+            method,
+            params,
+          })
+        );
+        return;
+      }
+
+      // 3) Method response
+      if (msg?.type === "res" && msg?.id === methodReqId) {
+        if (!msg.ok) {
+          const detail = msg?.error?.details
+            ? ` details=${JSON.stringify(msg.error.details)}`
+            : "";
+          return done(new Error(`${method} failed: ${msg?.error?.message || "unknown"}${detail}`));
+        }
+        return done(null, msg.payload);
+      }
+
+      // Ignore unrelated events/frames
+      if (!connected) return;
     });
 
     ws.on("error", (err) => {
@@ -127,7 +216,7 @@ async function gatewayCall(method, params = {}) {
       if (!settled) {
         done(
           new Error(
-            `Gateway WS closed (code=${code}, reason=${reason || "none"}, last=${lastMessage || "none"})`
+            `Gateway WS closed (code=${code}, reason=${reason || "none"}, last=${lastRaw || "none"})`
           )
         );
       }

@@ -1,5 +1,8 @@
-const express = require('express');
+const express = require("express");
+const { execFile } = require("node:child_process");
+const { promisify } = require("node:util");
 
+const execFileAsync = promisify(execFile);
 const app = express();
 
 // ---------- Required env ----------
@@ -8,92 +11,122 @@ const {
   SLACK_CLIENT_SECRET,
   SLACK_REDIRECT_URI, // must exactly match Slack app redirect URL
   SLACK_APP_TOKEN, // xapp-... (same app token reused for all workspaces)
-  OPENCLAW_GATEWAY_URL, // e.g. https://your-openclaw-host:18789
-  OPENCLAW_GATEWAY_TOKEN // gateway auth token
+  OPENCLAW_GATEWAY_URL, // must be ws://... or wss://... for gateway call
+  OPENCLAW_GATEWAY_TOKEN, // gateway auth token
 } = process.env;
 
 function required(name, value) {
   if (!value) throw new Error(`Missing env: ${name}`);
 }
 
-function escapeHtml(str = '') {
+function escapeHtml(str = "") {
   return String(str)
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll("'", '&#39;');
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
 }
 
 function makeAccountId(teamId) {
-  return `launchbased_${String(teamId).toLowerCase().replace(/[^a-z0-9_-]/g, '')}`;
+  return `launchbased_${String(teamId).toLowerCase().replace(/[^a-z0-9_-]/g, "")}`;
+}
+
+function ensureGatewayUrlLooksRight(url) {
+  if (!/^wss?:\/\//i.test(url || "")) {
+    throw new Error(
+      "OPENCLAW_GATEWAY_URL must be ws:// or wss:// (example: ws://159.203.104.70:18789)"
+    );
+  }
 }
 
 async function slackOAuthExchange(code) {
-  const resp = await fetch('https://slack.com/api/oauth.v2.access', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+  const resp = await fetch("https://slack.com/api/oauth.v2.access", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
       client_id: SLACK_CLIENT_ID,
       client_secret: SLACK_CLIENT_SECRET,
       code,
-      redirect_uri: SLACK_REDIRECT_URI
-    })
+      redirect_uri: SLACK_REDIRECT_URI,
+    }),
   });
-  return resp.json();
+
+  const data = await resp.json();
+  return data;
+}
+
+/**
+ * Calls OpenClaw gateway method through CLI (WS transport).
+ */
+async function gatewayCall(method, params = {}) {
+  const args = [
+    "gateway",
+    "call",
+    method,
+    "--url",
+    OPENCLAW_GATEWAY_URL,
+    "--token",
+    OPENCLAW_GATEWAY_TOKEN,
+    "--params",
+    JSON.stringify(params),
+    "--json",
+  ];
+
+  const { stdout, stderr } = await execFileAsync("openclaw", args, { timeout: 30000 });
+
+  if (stderr && stderr.trim()) {
+    // non-fatal warnings can appear on stderr
+    console.warn(`[gateway stderr] ${stderr.trim()}`);
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch (e) {
+    throw new Error(
+      `Gateway call returned non-JSON output: ${stdout?.slice(0, 500) || "<empty>"}`
+    );
+  }
+
+  // Common output shapes: {result: ...} or direct object
+  if (parsed?.error) {
+    throw new Error(parsed.error.message || JSON.stringify(parsed.error));
+  }
+
+  return parsed?.result ?? parsed;
+}
+
+function extractConfigObject(cfgResult) {
+  // Try multiple likely shapes
+  return cfgResult?.config || cfgResult?.value || cfgResult?.parsed || cfgResult?.data || {};
 }
 
 async function gatewayConfigGet() {
-  const r = await fetch(`${OPENCLAW_GATEWAY_URL}/rpc`, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      authorization: `Bearer ${OPENCLAW_GATEWAY_TOKEN}`
-    },
-    body: JSON.stringify({
-      id: `cfg-get-${Date.now()}`,
-      method: 'config.get',
-      params: {}
-    })
-  });
-  const j = await r.json();
-  if (j.error) throw new Error(`config.get failed: ${j.error.message || JSON.stringify(j.error)}`);
-  return j.result;
+  return gatewayCall("config.get", {});
 }
 
 async function gatewayConfigPatch(baseHash, patch, note) {
-  const r = await fetch(`${OPENCLAW_GATEWAY_URL}/rpc`, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      authorization: `Bearer ${OPENCLAW_GATEWAY_TOKEN}`
-    },
-    body: JSON.stringify({
-      id: `cfg-patch-${Date.now()}`,
-      method: 'config.patch',
-      params: {
-        raw: JSON.stringify(patch),
-        baseHash,
-        note
-      }
-    })
+  return gatewayCall("config.patch", {
+    raw: JSON.stringify(patch),
+    baseHash,
+    note,
   });
-  const j = await r.json();
-  if (j.error) throw new Error(`config.patch failed: ${j.error.message || JSON.stringify(j.error)}`);
-  return j.result;
 }
 
-app.get('/slack/oauth', async (req, res) => {
+app.get("/slack/oauth", async (req, res) => {
   try {
-    required('SLACK_CLIENT_ID', SLACK_CLIENT_ID);
-    required('SLACK_CLIENT_SECRET', SLACK_CLIENT_SECRET);
-    required('SLACK_REDIRECT_URI', SLACK_REDIRECT_URI);
-    required('SLACK_APP_TOKEN', SLACK_APP_TOKEN);
-    required('OPENCLAW_GATEWAY_URL', OPENCLAW_GATEWAY_URL);
-    required('OPENCLAW_GATEWAY_TOKEN', OPENCLAW_GATEWAY_TOKEN);
+    required("SLACK_CLIENT_ID", SLACK_CLIENT_ID);
+    required("SLACK_CLIENT_SECRET", SLACK_CLIENT_SECRET);
+    required("SLACK_REDIRECT_URI", SLACK_REDIRECT_URI);
+    required("SLACK_APP_TOKEN", SLACK_APP_TOKEN);
+    required("OPENCLAW_GATEWAY_URL", OPENCLAW_GATEWAY_URL);
+    required("OPENCLAW_GATEWAY_TOKEN", OPENCLAW_GATEWAY_TOKEN);
+
+    ensureGatewayUrlLooksRight(OPENCLAW_GATEWAY_URL);
 
     const code = req.query.code;
-    if (!code) return res.status(400).send('❌ No code provided by Slack.');
+    if (!code) return res.status(400).send("❌ No code provided by Slack.");
 
     // 1) Exchange Slack OAuth code
     const data = await slackOAuthExchange(code);
@@ -101,26 +134,49 @@ app.get('/slack/oauth', async (req, res) => {
     if (!data.ok) {
       return res
         .status(400)
-        .send(`<h1>❌ Slack OAuth failed</h1><p>${escapeHtml(data.error || 'unknown_error')}</p>`);
+        .send(`<h1>❌ Slack OAuth failed</h1><p>${escapeHtml(data.error || "unknown_error")}</p>`);
     }
 
     const teamId = data.team?.id;
-    const teamName = data.team?.name || 'Slack Workspace';
+    const teamName = data.team?.name || "Slack Workspace";
     const botToken = data.access_token; // xoxb for this workspace
     const accountId = makeAccountId(teamId);
 
     if (!teamId || !botToken) {
-      return res.status(500).send('❌ Slack response missing team.id/access_token.');
+      return res.status(500).send("❌ Slack response missing team.id/access_token.");
     }
 
     // 2) Read current config
-    const cfg = await gatewayConfigGet();
-    const baseHash = cfg.hash;
+    const cfgResult = await gatewayConfigGet();
+    const baseHash = cfgResult?.hash;
+    if (!baseHash) {
+      throw new Error("config.get response missing hash.");
+    }
 
-    // 3) Patch: add Slack account + binding to main
+    const currentConfig = extractConfigObject(cfgResult);
+    const existingBindings = Array.isArray(currentConfig?.bindings) ? currentConfig.bindings : [];
+
+    // Deduplicate binding
+    const newBinding = {
+      agentId: "main",
+      match: { channel: "slack", accountId },
+    };
+
+    const alreadyBound = existingBindings.some(
+      (b) =>
+        b?.agentId === "main" &&
+        b?.match?.channel === "slack" &&
+        b?.match?.accountId === accountId
+    );
+
+    const mergedBindings = alreadyBound ? existingBindings : [...existingBindings, newBinding];
+
+    // 3) Patch: add/update Slack account + preserve/append bindings
     const patch = {
       channels: {
         slack: {
+          enabled: true,
+          mode: "socket",
           accounts: {
             [accountId]: {
               name: `LaunchBased ${teamName}`,
@@ -129,17 +185,12 @@ app.get('/slack/oauth', async (req, res) => {
               appToken: SLACK_APP_TOKEN,
               userTokenReadOnly: true,
               nativeStreaming: true,
-              streaming: 'partial'
-            }
-          }
-        }
+              streaming: "partial",
+            },
+          },
+        },
       },
-      bindings: [
-        {
-          agentId: 'main',
-          match: { channel: 'slack', accountId }
-        }
-      ]
+      bindings: mergedBindings,
     };
 
     await gatewayConfigPatch(
@@ -157,10 +208,8 @@ app.get('/slack/oauth', async (req, res) => {
       </div>
     `);
   } catch (err) {
-    console.error('OAuth callback error:', err);
-    return res
-      .status(500)
-      .send(`❌ Server error: ${escapeHtml(err.message || String(err))}`);
+    console.error("OAuth callback error:", err);
+    return res.status(500).send(`❌ Server error: ${escapeHtml(err.message || String(err))}`);
   }
 });
 

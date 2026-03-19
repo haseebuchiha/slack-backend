@@ -1,8 +1,6 @@
 const express = require("express");
-const { execFile } = require("node:child_process");
-const { promisify } = require("node:util");
+const WebSocket = require("ws");
 
-const execFileAsync = promisify(execFile);
 const app = express();
 
 // ---------- Required env ----------
@@ -11,7 +9,7 @@ const {
   SLACK_CLIENT_SECRET,
   SLACK_REDIRECT_URI, // must exactly match Slack app redirect URL
   SLACK_APP_TOKEN, // xapp-... (same app token reused for all workspaces)
-  OPENCLAW_GATEWAY_URL, // must be ws://... or wss://... for gateway call
+  OPENCLAW_GATEWAY_URL, // ws://... or wss://...
   OPENCLAW_GATEWAY_TOKEN, // gateway auth token
 } = process.env;
 
@@ -29,7 +27,9 @@ function escapeHtml(str = "") {
 }
 
 function makeAccountId(teamId) {
-  return `launchbased_${String(teamId).toLowerCase().replace(/[^a-z0-9_-]/g, "")}`;
+  return `launchbased_${String(teamId)
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]/g, "")}`;
 }
 
 function ensureGatewayUrlLooksRight(url) {
@@ -52,53 +52,80 @@ async function slackOAuthExchange(code) {
     }),
   });
 
-  const data = await resp.json();
-  return data;
+  return resp.json();
 }
 
 /**
- * Calls OpenClaw gateway method through CLI (WS transport).
+ * JSON-RPC over WebSocket to OpenClaw gateway.
  */
 async function gatewayCall(method, params = {}) {
-  const args = [
-    "gateway",
-    "call",
-    method,
-    "--url",
-    OPENCLAW_GATEWAY_URL,
-    "--token",
-    OPENCLAW_GATEWAY_TOKEN,
-    "--params",
-    JSON.stringify(params),
-    "--json",
-  ];
+  return new Promise((resolve, reject) => {
+    const id = `rpc-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    let settled = false;
 
-  const { stdout, stderr } = await execFileAsync("openclaw", args, { timeout: 30000 });
+    const ws = new WebSocket(OPENCLAW_GATEWAY_URL, {
+      headers: {
+        Authorization: `Bearer ${OPENCLAW_GATEWAY_TOKEN}`,
+      },
+    });
 
-  if (stderr && stderr.trim()) {
-    // non-fatal warnings can appear on stderr
-    console.warn(`[gateway stderr] ${stderr.trim()}`);
-  }
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try {
+        ws.close();
+      } catch {}
+      reject(new Error("Gateway WebSocket timeout"));
+    }, 25000);
 
-  let parsed;
-  try {
-    parsed = JSON.parse(stdout);
-  } catch (e) {
-    throw new Error(
-      `Gateway call returned non-JSON output: ${stdout?.slice(0, 500) || "<empty>"}`
-    );
-  }
+    ws.on("open", () => {
+      ws.send(JSON.stringify({ id, method, params }));
+    });
 
-  // Common output shapes: {result: ...} or direct object
-  if (parsed?.error) {
-    throw new Error(parsed.error.message || JSON.stringify(parsed.error));
-  }
+    ws.on("message", (buf) => {
+      if (settled) return;
 
-  return parsed?.result ?? parsed;
+      let msg;
+      try {
+        msg = JSON.parse(buf.toString());
+      } catch {
+        return; // ignore non-JSON frames
+      }
+
+      // ignore unrelated events/messages
+      if (!msg || msg.id !== id) return;
+
+      settled = true;
+      clearTimeout(timer);
+      try {
+        ws.close();
+      } catch {}
+
+      if (msg.error) {
+        reject(new Error(msg.error.message || JSON.stringify(msg.error)));
+        return;
+      }
+
+      resolve(msg.result ?? msg);
+    });
+
+    ws.on("error", (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(err);
+    });
+
+    ws.on("close", () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(new Error("Gateway WebSocket closed before response"));
+    });
+  });
 }
 
 function extractConfigObject(cfgResult) {
-  // Try multiple likely shapes
   return cfgResult?.config || cfgResult?.value || cfgResult?.parsed || cfgResult?.data || {};
 }
 
@@ -149,14 +176,12 @@ app.get("/slack/oauth", async (req, res) => {
     // 2) Read current config
     const cfgResult = await gatewayConfigGet();
     const baseHash = cfgResult?.hash;
-    if (!baseHash) {
-      throw new Error("config.get response missing hash.");
-    }
+    if (!baseHash) throw new Error("config.get response missing hash.");
 
     const currentConfig = extractConfigObject(cfgResult);
     const existingBindings = Array.isArray(currentConfig?.bindings) ? currentConfig.bindings : [];
 
-    // Deduplicate binding
+    // 3) Merge binding safely (do not overwrite old bindings)
     const newBinding = {
       agentId: "main",
       match: { channel: "slack", accountId },
@@ -171,7 +196,7 @@ app.get("/slack/oauth", async (req, res) => {
 
     const mergedBindings = alreadyBound ? existingBindings : [...existingBindings, newBinding];
 
-    // 3) Patch: add/update Slack account + preserve/append bindings
+    // 4) Patch account + bindings
     const patch = {
       channels: {
         slack: {
